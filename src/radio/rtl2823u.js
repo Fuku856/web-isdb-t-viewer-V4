@@ -122,9 +122,7 @@ export default function RTL2832U(conn, ppm, opt_gain) {
         !!usbDevice &&
         usbDevice.manufacturerName === 'RTLSDRBlog' &&
         /^Blog V4$/.test(usbDevice.productName || '');
-      var tunerXtal = blogV4
-        ? xtalFreq
-        : Math.floor(16000000 * (1 + ppm / 1000000));
+      var tunerXtal = blogV4 ? xtalFreq : Math.floor(16000000 * (1 + ppm / 1000000));
       tuner = new R820T(com, tunerXtal, {
         addr: 0x74,
         r828d: true,

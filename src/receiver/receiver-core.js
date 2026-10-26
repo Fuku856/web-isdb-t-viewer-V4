@@ -5,6 +5,11 @@ import { channels } from './channels.js';
 import RtlSdr from '../radio/rtlsdr.js';
 import { SAMPLE_RATE, TUNER_OFFSET } from './dsp.js';
 
+const MAX_DECODERS = Math.max(
+  1,
+  Math.min(2, ((typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 2) - 1),
+);
+
 export const initialState = {
   status: 'Disconnected',
   connected: false,
@@ -23,6 +28,9 @@ export const initialState = {
 };
 export class Receiver {
   constructor(update) {
+    this.maxDecoders = MAX_DECODERS;
+    this.inflight = 0;
+    this.applyChain = Promise.resolve();
     this.update = update;
     this.state = { ...initialState };
     this.jobs = new Set();
@@ -86,7 +94,8 @@ export class Receiver {
   stop() {
     if (this.stopping) return this.stopping;
     ++this.epoch;
-    this.pending = null;
+    this.inflight = 0;
+    this.applyChain = Promise.resolve();
     this.state.stream?.close();
     for (const job of this.jobs) job.cancel();
     this.jobs.clear();
@@ -173,7 +182,8 @@ export class Receiver {
       decodeMs: 0,
       status: 'Tuning',
     });
-    this.processing = false;
+    this.inflight = 0;
+    this.applyChain = Promise.resolve();
     let monitoring = false;
     try {
       await device.setGain(gain);
@@ -230,10 +240,8 @@ export class Receiver {
             });
         }
         if (index === count) {
-          if (this.pending) this.emit({ dropped: this.state.dropped + 1 });
           const overlap = bytes.slice(stride * block * 2);
-          this.pending = { bytes, options, capturedAt };
-          void this.drain(epoch);
+          this.enqueue(epoch, { bytes, options, capturedAt });
           bytes = new Uint8Array(count * block * 2);
           bytes.set(overlap);
           index = count - stride;
@@ -247,49 +255,60 @@ export class Receiver {
       }
     }
   }
-  async drain(epoch) {
-    if (this.processing) return;
-    this.processing = true;
-    try {
-      while (this.pending && epoch === this.epoch) {
-        const capture = this.pending;
-        this.pending = null;
-        try {
-          const decodeStarted = performance.now();
-          const result = await this.analyze(capture.bytes, capture.options);
-          if (epoch !== this.epoch) return;
-          this.emit({ result, decodeMs: performance.now() - decodeStarted });
-          if (!result.transport.bytes.length) {
-            this.emit({ status: 'Searching', error: result.transport.error });
-            continue;
-          }
-          const joined = this.joiner.push(result.transport.bytes);
-          if (joined.discontinuity) {
-            this.programInformation.resetFragments();
-            this.log('Transport discontinuity: reacquiring playback');
-            this.state.stream.close();
-            this.emit({ stream: new LiveTransport() });
-          }
-          const playable = this.association.push(joined.bytes);
-          this.emit({
-            programInformation: this.programInformation.push(
-              joined.bytes,
-              this.association.program?.number,
-            ),
-          });
-          this.state.stream.write(playable);
-          if (!playable.length) this.log('Waiting for a one-seg PMT');
-          this.emit({
-            error: '',
-            status: 'Receiving',
-            latency: (Date.now() - capture.capturedAt) / 1000,
-          });
-        } catch (error) {
-          if (epoch === this.epoch) this.emit({ error: error.message, status: 'Searching' });
-        }
-      }
-    } finally {
-      if (epoch === this.epoch) this.processing = false;
+  // Decode captures on up to MAX_DECODERS workers at once, but apply results
+  // strictly in capture order so the transport stream stays continuous.
+  enqueue(epoch, capture) {
+    if (this.inflight >= this.maxDecoders) {
+      this.emit({ dropped: this.state.dropped + 1 });
+      return;
     }
+    this.inflight++;
+    const started = performance.now();
+    const job = this.analyze(capture.bytes, capture.options).then(
+      (result) => ({ result, decodeMs: performance.now() - started }),
+      (error) => ({ error }),
+    );
+    this.applyChain = this.applyChain.then(async () => {
+      const outcome = await job;
+      if (epoch !== this.epoch) return;
+      this.inflight--;
+      if (outcome.error) {
+        this.emit({ error: outcome.error.message, status: 'Searching' });
+        return;
+      }
+      try {
+        this.apply(outcome.result, capture, outcome.decodeMs);
+      } catch (error) {
+        this.emit({ error: error.message, status: 'Searching' });
+      }
+    });
+  }
+  apply(result, capture, decodeMs) {
+    this.emit({ result, decodeMs });
+    if (!result.transport.bytes.length) {
+      this.emit({ status: 'Searching', error: result.transport.error });
+      return;
+    }
+    const joined = this.joiner.push(result.transport.bytes);
+    if (joined.discontinuity) {
+      this.programInformation.resetFragments();
+      this.log('Transport discontinuity: reacquiring playback');
+      this.state.stream.close();
+      this.emit({ stream: new LiveTransport() });
+    }
+    const playable = this.association.push(joined.bytes);
+    this.emit({
+      programInformation: this.programInformation.push(
+        joined.bytes,
+        this.association.program?.number,
+      ),
+    });
+    this.state.stream.write(playable);
+    if (!playable.length) this.log('Waiting for a one-seg PMT');
+    this.emit({
+      error: '',
+      status: 'Receiving',
+      latency: (Date.now() - capture.capturedAt) / 1000,
+    });
   }
 }

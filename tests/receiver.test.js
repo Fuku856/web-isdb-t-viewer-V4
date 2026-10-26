@@ -29,7 +29,7 @@ test('stop cancels decoder jobs and releases the USB device', async () => {
       cancelled++;
     },
   });
-  receiver.pending = { bytes: new Uint8Array(100) };
+  receiver.inflight = 1;
   receiver.emit({
     running: true,
     connected: true,
@@ -38,7 +38,7 @@ test('stop cancels decoder jobs and releases the USB device', async () => {
   await receiver.stop();
   assert.equal(cancelled, 1);
   assert.equal(aborted, 1);
-  assert.equal(receiver.pending, null);
+  assert.equal(receiver.inflight, 0);
   assert.equal(receiver.jobs.size, 0);
   assert.equal(receiver.state.connected, false);
   assert.equal(receiver.state.programInformation, null);
@@ -72,21 +72,38 @@ test('decoder continues after a corrupt capture and publishes live transport', a
   receiver.state.stream.subscribe((bytes) => {
     delivered = bytes;
   });
-  receiver.pending = { bytes: new Uint8Array(), options: {}, capturedAt: Date.now() };
+  receiver.maxDecoders = 2;
   let calls = 0;
   receiver.analyze = async () => {
     calls++;
-    if (calls === 1) {
-      receiver.pending = { bytes: new Uint8Array(), options: {}, capturedAt: Date.now() };
-      throw new Error('Corrupt capture');
-    }
+    if (calls === 1) throw new Error('Corrupt capture');
     return { transport: { bytes: transport() } };
   };
-  await receiver.drain(receiver.epoch);
+  const capture = () => ({ bytes: new Uint8Array(), options: {}, capturedAt: Date.now() });
+  receiver.enqueue(receiver.epoch, capture());
+  receiver.enqueue(receiver.epoch, capture());
+  await receiver.applyChain;
   assert.equal(calls, 2);
   assert.deepEqual(delivered, transport());
   assert.equal(receiver.state.error, '');
-  assert.equal(receiver.processing, false);
+  assert.equal(receiver.inflight, 0);
+});
+test('parallel decodes are applied in capture order', async () => {
+  const receiver = new Receiver(() => {});
+  receiver.maxDecoders = 2;
+  const order = [];
+  receiver.apply = (result) => order.push(result.id);
+  let call = 0;
+  receiver.analyze = () => {
+    const id = ++call;
+    // The first capture finishes last.
+    return new Promise((resolve) => setTimeout(() => resolve({ id }), id === 1 ? 30 : 1));
+  };
+  const capture = () => ({ bytes: new Uint8Array(), options: {}, capturedAt: Date.now() });
+  receiver.enqueue(receiver.epoch, capture());
+  receiver.enqueue(receiver.epoch, capture());
+  await receiver.applyChain;
+  assert.deepEqual(order, [1, 2]);
 });
 test('log history is bounded', () => {
   const receiver = new Receiver(() => {});

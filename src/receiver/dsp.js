@@ -77,13 +77,15 @@ function spectrum(re, im, sampleRate, offset) {
   return { x, y };
 }
 
-// 64-tap windowed-sinc fractional resampler, 1024 precomputed phases.
-// Low-pass cutoff .235 cycles/input sample removes energy above output Nyquist.
+// 32-tap windowed-sinc fractional resampler, 1024 precomputed phases.
+// The 1seg segment occupies only +-0.105 cycles/input sample after mixing,
+// so a .22 cutoff keeps it flat while anything that could alias back onto
+// it (above .39 cycles/sample) is still well inside the Blackman stopband.
 function resample(re, im, sampleRate) {
-  const half = 32,
+  const half = 16,
     phases = 1024,
-    taps = 64,
-    cutoff = 0.235;
+    taps = 32,
+    cutoff = 0.22;
   const table = new Float64Array(phases * taps);
   for (let p = 0; p < phases; p++) {
     let sum = 0;
@@ -106,12 +108,22 @@ function resample(re, im, sampleRate) {
     const phase = Math.min(phases - 1, Math.floor((position - base) * phases));
     let a = 0,
       b = 0;
-    for (let t = 0; t < taps; t++) {
-      const j = base + t - half + 1;
-      if (j >= 0 && j < re.length) {
-        const h = table[phase * taps + t];
-        a += re[j] * h;
-        b += im[j] * h;
+    const first = base - half + 1,
+      row = phase * taps;
+    if (first >= 0 && first + taps <= re.length) {
+      for (let t = 0; t < taps; t++) {
+        const h = table[row + t];
+        a += re[first + t] * h;
+        b += im[first + t] * h;
+      }
+    } else {
+      for (let t = 0; t < taps; t++) {
+        const j = first + t;
+        if (j >= 0 && j < re.length) {
+          const h = table[row + t];
+          a += re[j] * h;
+          b += im[j] * h;
+        }
       }
     }
     r[i] = a;
@@ -144,7 +156,7 @@ export function synchronize(re, im) {
       const a = pr[i + guard] - pr[i],
         b = pi[i + guard] - pi[i];
       const denom = Math.sqrt((e1[i + guard] - e1[i]) * (e2[i + guard] - e2[i]));
-      folded[i % period] += Math.hypot(a, b) / Math.max(1e-15, denom) / blocks;
+      folded[i % period] += Math.sqrt(a * a + b * b) / Math.max(1e-15, denom) / blocks;
     }
     let timing = 0;
     for (let i = 1; i < period; i++) if (folded[i] > folded[timing]) timing = i;
@@ -162,12 +174,17 @@ export function synchronize(re, im) {
   for (let start = best.timing + best.guard - 8; start + n <= re.length; start += n + best.guard) {
     const r = new Float64Array(n),
       q = new Float64Array(n);
+    const step = (-TAU * cfo) / ANALYSIS_RATE,
+      sc = Math.cos(step),
+      ss = Math.sin(step);
+    let c = Math.cos(step * start),
+      s = Math.sin(step * start);
     for (let i = 0; i < n; i++) {
-      const angle = (-TAU * cfo * (start + i)) / ANALYSIS_RATE,
-        c = Math.cos(angle),
-        s = Math.sin(angle);
       r[i] = re[start + i] * c - im[start + i] * s;
       q[i] = re[start + i] * s + im[start + i] * c;
+      const nc = c * sc - s * ss;
+      s = c * ss + s * sc;
+      c = nc;
     }
     fft(r, q);
     spectra.push([r, q]);
@@ -341,14 +358,26 @@ export function analyzeIQ(
     im[i] -= mi;
   }
   const psd = spectrum(re, im, sampleRate, offset);
-  for (let i = 0; i < size; i++) {
-    const phase = (TAU * offset * i) / sampleRate,
-      c = Math.cos(phase),
-      s = Math.sin(phase),
-      a = re[i],
-      b = im[i];
-    re[i] = a * c - b * s;
-    im[i] = a * s + b * c;
+  // Mix the tuner offset down to 0 Hz. Rotate a phasor instead of calling
+  // cos/sin for every sample, renormalizing from an exact angle every block.
+  {
+    const step = (TAU * offset) / sampleRate,
+      sc = Math.cos(step),
+      ss = Math.sin(step);
+    for (let base = 0; base < size; base += 4096) {
+      let c = Math.cos(step * base),
+        s = Math.sin(step * base);
+      const end = Math.min(size, base + 4096);
+      for (let i = base; i < end; i++) {
+        const a = re[i],
+          b = im[i];
+        re[i] = a * c - b * s;
+        im[i] = a * s + b * c;
+        const nc = c * sc - s * ss;
+        s = c * ss + s * sc;
+        c = nc;
+      }
+    }
   }
   const [r, q] = resample(re, im, sampleRate);
   progress('OFDM synchronization');

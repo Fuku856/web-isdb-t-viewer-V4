@@ -1,5 +1,5 @@
 import { FREQUENCY_PERM, TMCC_H } from './isdb-tables.js';
-import { viterbi, rsDecode } from './fec.js';
+import { viterbi, rsDecode, PUNCTURE } from './fec.js';
 const TMCC = [2693, 2723, 2878, 2941].map((k) => k - 2592);
 const CONTROL = new Set(
   [2693, 2723, 2878, 2941, 2599, 2681, 2798, 2801, 2818, 2836, 2969, 2999].map((k) => k - 2592),
@@ -198,11 +198,17 @@ export function decodeTransport(carriers, metrics, progress = () => {}) {
   const soft = deinterleave(carriers, metrics.firstSpPhase, frame.interleave);
   let best = { score: 0 };
   // Unknown puncture phase after removing the acquisition transient.
-  const puncturePhases = [1, 4, 6, 10, 14][frame.rateIndex];
+  // Score each phase on a prefix of ~80 packets, then decode in full only once:
+  // a full-length Viterbi pass is by far the most expensive step.
+  const puncturePhases = [1, 4, 6, 10, 14][frame.rateIndex],
+    pattern = PUNCTURE[frame.rateIndex],
+    ones = pattern.reduce((a, b) => a + b, 0),
+    prefixSoft = Math.ceil((204 * 8 * 80 * 2 * ones) / pattern.length) + pattern.length,
+    probe =
+      puncturePhases > 1 && soft.length > prefixSoft * 2 ? soft.subarray(0, prefixSoft) : soft;
   for (let phase = 0; phase < puncturePhases; phase++) {
-    progress(`Viterbi decoding ${phase + 1}/${puncturePhases}`);
-    const bits = viterbi(soft, frame.rateIndex, phase),
-      alignment = packetAlignment(bits);
+    progress(`Viterbi phase search ${phase + 1}/${puncturePhases}`);
+    const alignment = packetAlignment(viterbi(probe, frame.rateIndex, phase));
     if (alignment.score > best.score) best = { ...alignment, puncturePhase: phase };
     if (alignment.score > 0.85) break;
   }
@@ -210,6 +216,14 @@ export function decodeTransport(carriers, metrics, progress = () => {}) {
   info.puncturePhase = best.puncturePhase;
   if (best.score < 0.15)
     return { ...info, bytes: new Uint8Array(), error: 'No transport packet synchronization' };
+  if (probe !== soft) {
+    progress('Viterbi decoding');
+    best = {
+      ...packetAlignment(viterbi(soft, frame.rateIndex, best.puncturePhase)),
+      puncturePhase: best.puncturePhase,
+    };
+    info.syncScore = best.score;
+  }
   progress('Byte deinterleaving and RS correction');
   return { ...info, ...decodePackets(best, frame.rateIndex) };
 }
