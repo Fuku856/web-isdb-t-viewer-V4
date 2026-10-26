@@ -20,6 +20,8 @@ import RtlCom from './rtlcom.js';
 var CMD = RtlCom.CMD;
 var BLOCK = RtlCom.BLOCK;
 var REG = RtlCom.REG;
+/** RTL2832U GPIO registers (SYS block). */
+var GPIO = { GPO: 0x3001, GPOE: 0x3003, GPD: 0x3004 };
 
 /**
  * Operations on the RTL2832U demodulator.
@@ -110,14 +112,30 @@ export default function RTL2832U(conn, ppm, opt_gain) {
 
     var xtalFreq = Math.floor(XTAL_FREQ * (1 + ppm / 1000000));
     await com.i2c.open();
-    var found = await R820T.check(com);
-    if (found) {
+    if (await R820T.check(com, 0x34)) {
       tuner = new R820T(com, xtalFreq);
+    } else if (await R820T.check(com, 0x74)) {
+      // R828D. The RTL-SDR Blog V4 feeds it the shared 28.8 MHz clock;
+      // other R828D sticks use a dedicated 16 MHz crystal.
+      var usbDevice = conn && conn._device;
+      var blogV4 =
+        !!usbDevice &&
+        usbDevice.manufacturerName === 'RTLSDRBlog' &&
+        /^Blog V4$/.test(usbDevice.productName || '');
+      var tunerXtal = blogV4
+        ? xtalFreq
+        : Math.floor(16000000 * (1 + ppm / 1000000));
+      tuner = new R820T(com, tunerXtal, {
+        addr: 0x74,
+        r828d: true,
+        blogV4: blogV4,
+        setGpio: setGpio,
+      });
     }
     if (!tuner) {
       throw new Error(
         'Sorry, your USB dongle has an unsupported tuner chip. ' +
-          'Only the R820T chip is supported.',
+          'Only R820T/R820T2 and R828D (RTL-SDR Blog V4) are supported.',
       );
     }
     var multiplier = -1 * Math.floor((IF_FREQ * (1 << 22)) / xtalFreq);
@@ -132,6 +150,21 @@ export default function RTL2832U(conn, ppm, opt_gain) {
     await tuner.init();
     await setGain(opt_gain);
     await com.i2c.close();
+  }
+
+  /**
+   * Drives one RTL2832U GPIO pin as an output.
+   * @param {number} pin GPIO number.
+   * @param {boolean} on Output level.
+   */
+  async function setGpio(pin, on) {
+    var bit = 1 << pin;
+    var gpd = await com.readRegister(BLOCK.SYS, GPIO.GPD, 1);
+    await com.writeRegister(BLOCK.SYS, GPIO.GPD, gpd & ~bit, 1);
+    var gpoe = await com.readRegister(BLOCK.SYS, GPIO.GPOE, 1);
+    await com.writeRegister(BLOCK.SYS, GPIO.GPOE, gpoe | bit, 1);
+    var gpo = await com.readRegister(BLOCK.SYS, GPIO.GPO, 1);
+    await com.writeRegister(BLOCK.SYS, GPIO.GPO, on ? gpo | bit : gpo & ~bit, 1);
   }
 
   /**

@@ -23,7 +23,15 @@ var CMD = RtlCom.CMD;
  * @param {number} xtalFreq The frequency of the oscillator crystal.
  * @class
  */
-export default function R820T(com, xtalFreq) {
+export default function R820T(com, xtalFreq, opt_options) {
+  var options = opt_options || {};
+  /** I2C address: 0x34 for R820T/R820T2, 0x74 for R828D. */
+  var addr = options.addr || 0x34;
+  /** R828D (RTL-SDR Blog V4 etc.) uses a different VCO power reference. */
+  var vcoPowerRef = options.r828d ? 1 : 2;
+  /** RTL-SDR Blog V4: tuner inputs are switched per band. */
+  var blogV4 = !!options.blogV4;
+  var v4Band = null;
   /**
    * Initial values for registers 0x05-0x1f.
    */
@@ -86,7 +94,32 @@ export default function R820T(com, xtalFreq) {
     const actual = await setPll(freq);
     if (!hasPllLock || !Number.isFinite(actual))
       throw new Error('PLL failed to lock. Reconnect and select a channel.');
+    if (blogV4) await setBlogV4Input(freq);
     return actual;
+  }
+
+  /**
+   * Selects the RF input and notch filters on the RTL-SDR Blog V4,
+   * following rtl-sdr-blog's tuner_r82xx.c.
+   * HF (<=28.8 MHz) -> Cable2 (upconverter), VHF (<250 MHz) -> Cable1, UHF -> Air.
+   * @param {number} freq The tuned frequency in Hz.
+   */
+  async function setBlogV4Input(freq) {
+    var openD =
+      freq <= 2200000 ||
+      (freq >= 85000000 && freq <= 112000000) ||
+      (freq >= 172000000 && freq <= 242000000)
+        ? 0x00
+        : 0x08;
+    await writeRegMask(0x17, openD, 0x08);
+    var band = freq <= 28800000 ? 'HF' : freq < 250000000 ? 'VHF' : 'UHF';
+    if (band === v4Band) return;
+    v4Band = band;
+    var cable2In = band === 'HF' ? 0x08 : 0x00;
+    await writeRegMask(0x06, cable2In, 0x08);
+    if (options.setGpio) await options.setGpio(5, !cable2In);
+    await writeRegMask(0x05, band === 'VHF' ? 0x40 : 0x00, 0x40);
+    await writeRegMask(0x05, band === 'UHF' ? 0x00 : 0x20, 0x20);
   }
 
   /**
@@ -256,9 +289,9 @@ export default function R820T(com, xtalFreq) {
     var data = await readRegBuffer(0x00, 5);
     var arr = new Uint8Array(data);
     var vcoFineTune = (arr[4] & 0x30) >> 4;
-    if (vcoFineTune > 2) {
+    if (vcoFineTune > vcoPowerRef) {
       --divNum;
-    } else if (vcoFineTune < 2) {
+    } else if (vcoFineTune < vcoPowerRef) {
       ++divNum;
     }
     await writeRegMask(0x10, divNum << 5, 0xe0);
@@ -314,7 +347,7 @@ export default function R820T(com, xtalFreq) {
     shadowRegs = new Uint8Array(regs);
     var cmds = [];
     for (var i = 0; i < regs.length; ++i) {
-      cmds.push([CMD.I2CREG, 0x34, i + 5, regs[i]]);
+      cmds.push([CMD.I2CREG, addr, i + 5, regs[i]]);
     }
     await com.writeEach(cmds);
   }
@@ -325,8 +358,8 @@ export default function R820T(com, xtalFreq) {
    * @param {number} length The number of registers to read.
    * @returns {ArrayBuffer} An ArrayBuffer with the data.
    */
-  async function readRegBuffer(addr, length) {
-    var data = await com.i2c.readRegBuffer(0x34, addr, length);
+  async function readRegBuffer(reg, length) {
+    var data = await com.i2c.readRegBuffer(addr, reg, length);
     var buf = new Uint8Array(data);
     for (var i = 0; i < buf.length; ++i) {
       var b = buf[i];
@@ -341,11 +374,11 @@ export default function R820T(com, xtalFreq) {
    * @param {number} value The value to write.
    * @param {number} mask A mask that specifies which bits to write.
    */
-  async function writeRegMask(addr, value, mask) {
-    var rc = shadowRegs[addr - 5];
+  async function writeRegMask(reg, value, mask) {
+    var rc = shadowRegs[reg - 5];
     var val = (rc & ~mask) | (value & mask);
-    shadowRegs[addr - 5] = val;
-    await com.i2c.writeRegister(0x34, addr, val);
+    shadowRegs[reg - 5] = val;
+    await com.i2c.writeRegister(addr, reg, val);
   }
 
   /**
@@ -373,7 +406,12 @@ export default function R820T(com, xtalFreq) {
  * @param {RtlCom} com The RTL communications object.
  * @returns {boolean} A boolean that tells whether the tuner is present.
  */
-R820T.check = async function (com) {
-  var data = await com.i2c.readRegister(0x34, 0);
-  return data == 0x69;
+R820T.check = async function (com, opt_addr) {
+  // A missing chip NACKs the I2C transfer, which surfaces as a USB error.
+  try {
+    var data = await com.i2c.readRegister(opt_addr || 0x34, 0);
+    return data == 0x69;
+  } catch {
+    return false;
+  }
 };
